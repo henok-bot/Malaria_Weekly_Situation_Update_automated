@@ -1,0 +1,572 @@
+---
+title: "Malaria Weekly Situtaion Update"
+subtitle: "Week 29, 2025"
+author: "cPHEM, EPHI"
+format: 
+ #html: default
+ docx: default
+  #reference-doc: custom-reference-doc.docx
+execute: 
+  echo: false
+  warning: false
+editor: visual
+---
+
+```{r}
+#| label: Data importing and processing 
+#| include: false
+pacman::p_load(tidyverse, readxl, import, here, janitor, rio, magrittr, esquisse,
+               stringdist, reshape2, scales, ggsci, RColorBrewer, skimr, patchwork)
+
+pacman::p_load(
+  rio,           # to import data
+  here,          # to locate files
+  tidyverse,     # to clean, handle, and plot the data (includes ggplot2 package)
+  sf,            # to manage spatial data using a Simple Feature format
+  tmap,          # to produce simple maps, works for both interactive and static maps
+  janitor,       # to clean column names
+  #OpenStreetMap, # to add OSM basemap in ggplot map
+  spdep ,         # spatial statistics,
+  here
+)
+
+malaria_dat <- import(here("C:/Users/henok/OneDrive - ITG/Desktop/Database/Malaria Cluster Data.xlsx"), guess_max = 400000)
+# malaria_dat <- import(here("/Users/henoktadesse/Library/CloudStorage/OneDrive-ITG/Desktop/Database/Malaria Cluster Data.xlsx"), guess_max = 400000)
+
+colnames(malaria_dat)
+eth_adm3_raw <- read_sf(here("ETH shape file 2024/eth_admbnda_adm3_csa_bofedb_2021.shp"))
+eth_adm3 <- eth_adm3_raw %>%  janitor::clean_names()
+
+eth_adm1 <- read_sf(here("ETH shape file 2024/eth_admbnda_adm1_csa_bofedb_2021.shp")) %>%  
+  janitor::clean_names()
+
+#Change those read as numeric to character
+columns_to_exclude <- c(1:7)
+malaria_dat %<>% mutate(across(.cols = where(is.character) & !all_of(columns_to_exclude), .fns = as.numeric))
+#Chnage the name to match wiht previous data set for downstream script 
+malaria_dat  %<>%  dplyr::rename('Total Malaria (Confirmed and Clinical)' = 'Total Malaria Case',
+                           'PosMalaria_RDT_or_Microscopy_Mixed_OutP_Cases' = 'PosMalaria_RDT_or_Microscopy_mixed_OutP_Cases2')
+###2. Basic data cleaning ################
+
+# cleaning column names
+mal_dat <-  malaria_dat %>% janitor::clean_names() %>% 
+  rename(total_case = total_malaria_confirmed_and_clinical,
+         outp_case = t_malaria_out_p_cases,
+         inp_case = t_malaria_in_p_cases,
+         death = t_malaria_in_p_deaths,
+         pf = pos_malaria_rdt_or_microscopy_pf_out_p_cases,
+         pv = pos_malaria_rdt_or_microscopy_pv_out_p_cases,
+         mixed = pos_malaria_rdt_or_microscopy_mixed_out_p_cases,
+         test = tm_suspected_fever_examined,
+         total_confirmed_s = total_confirmed,
+         confirm_rate_s = percent_of_confirmed,
+         pos_rate_s = test_positivity)
+# computing row wise values 
+
+mal_dat <- mal_dat %>% rowwise() %>% mutate(total_confirmed_s = sum(pf,pv,mixed,na.rm = T),
+                                            confirm_rate_s = round((total_confirmed_s/total_case)*100, 2),
+                                            pos_rate_s = round((total_confirmed_s/test)*100, 2),
+                                            inp_rate = round((inp_case/total_case) * 100, 1),
+                                            cfr = round((death/total_case)*100, 3)) %>% ungroup()
+
+nat_trend <- mal_dat %>% group_by(year,epi_week) %>% 
+  summarise(total_case = sum(total_case, na.rm = T),
+            inp_rate_s = round((sum(inp_case, na.rm = T)/sum(total_case, na.rm = T))* 100, 2),
+            inp_rate = round(mean(inp_rate[is.finite(inp_rate)], na.rm = T),1),
+            cfr = round(mean(cfr[is.finite(cfr)], na.rm = T), 1),
+            .groups = "drop")
+
+mal_dat <- mal_dat %>% 
+  mutate(region = str_squish(str_to_title(region))) #Trim and convert to lowercase
+
+wkly_dat <- mal_dat %>% select(region, zone, g_name, year, epi_week, total_case,
+                               death, test,  total_confirmed_s, pos_rate_s) %>% 
+  filter(year == 2025 & epi_week == max(epi_week[year == 2025], na.rm = T)) %>% 
+  group_by(g_name) %>% 
+  summarise( total_case = sum(total_case, na.rm = T),
+             total_conf = sum(total_confirmed_s, na.rm = T),
+             death = sum(death, na.rm = T),
+             pos_rate = round(sum(total_case, na.rm = T)/sum(test, na.rm = T) * 100, 2),
+             .groups = "drop")
+
+pop <- import(here("Pop/Population by GIS woreda.xlsx"))
+ref_gname <- import(here("pop/Shape file attribute table (2).csv"))
+
+wkly_dat <- wkly_dat %>% left_join(pop, by =c("g_name" = "Gnames")) %>% janitor::clean_names() 
+
+wkly_dat <- wkly_dat %>% rowwise() %>% 
+  mutate(mal_ar = round(total_conf/population * 1000, 2)) %>% 
+  ungroup()
+wkly_dat %<>% rename(woreda = g_name)
+
+```
+
+```{r}
+#| label: Inline values
+#| include: true
+
+# Latest week
+latest_week <- nat_trend %>% filter(year == 2025) %>% summarise(max(epi_week, na.rm = TRUE)) %>% pull()
+
+# Current week stats
+this_year <- mal_dat  %>% filter(year == 2025)
+this_week <- mal_dat %>% filter(year == 2025, epi_week == latest_week)
+prev_week <- mal_dat %>% filter(year == 2025, epi_week == latest_week - 1)
+same_week_last_year <- mal_dat %>% filter(year == 2024, epi_week == latest_week)
+case_this_year <- sum(this_year$total_case, na.rm = T)
+death_this_year <- sum(this_year$death, na.rm = T)
+
+# Aggregated national values
+cases_this_week <- sum(this_week$total_case, na.rm = TRUE)
+cases_last_week <- sum(prev_week$total_case, na.rm = TRUE)
+cases_last_year <- sum(same_week_last_year$total_case, na.rm = TRUE)
+
+# Compute % change
+week_over_week_change <- round((cases_this_week - cases_last_week) / cases_last_week * 100, 1)
+yoy_change <- round((cases_this_week - cases_last_year) / cases_last_year * 100, 1)
+
+# Deaths
+deaths_this_week <- sum(this_week$death, na.rm = TRUE)
+
+# Inpatient rate
+inpatient_this_week <- round((sum(this_week$inp_case, na.rm = TRUE) / sum(this_week$total_case, na.rm = TRUE)) * 100, 1)
+inpatient_last_year <- round((sum(same_week_last_year$inp_case, na.rm = TRUE) / sum(same_week_last_year$total_case, na.rm = TRUE)) * 100, 1)
+inpatient_change <- round(((inpatient_this_week - inpatient_last_year) / inpatient_last_year) * 100, 1)
+
+# Case fatality rate
+cfr_this_week <- round((sum(this_week$death, na.rm = TRUE) / sum(this_week$total_case, na.rm = TRUE)) * 100, 3)
+cfr_last_year <- round((sum(same_week_last_year$death, na.rm = TRUE) / sum(same_week_last_year$total_case, na.rm = TRUE)) * 100, 3)
+cfr_change <- round(((cfr_this_week - cfr_last_year) / cfr_last_year) * 100, 1)
+
+# Top 5 regions this week
+top_regions <- this_week %>%
+  group_by(region) %>%
+  summarise(cases = sum(total_case, na.rm = TRUE)) %>%
+  mutate(pct = round(cases / sum(cases) * 100, 1)) %>%
+  arrange(desc(cases)) %>%
+  slice(1:5)
+
+
+top_regions_text <- paste0(top_regions$region, " (", top_regions$pct, "%)", collapse = ", ")
+
+# Create a vector of bulleted text lines for top 5 regions
+top_regions_bullets <- paste0("- ", top_regions$region, " (", top_regions$pct, "%)")
+
+
+# Total confirmed percent
+lab_confirm_rate <- round(sum(this_week$total_confirmed_s, na.rm = TRUE) / sum(this_week$total_case, na.rm = TRUE) * 100, 1)
+
+# Pf proportion
+pf_rate <- round(sum(this_week$pf, na.rm = TRUE) / sum(this_week$total_confirmed_s, na.rm = TRUE) * 100, 1)
+
+# Number of woredas reporting at least 1 case
+woreda_count <- this_week %>% filter(total_case > 0) %>% distinct(g_name) %>% nrow()
+
+#Death reporting woredas and number 
+
+dth_report <- this_week %>% filter(death > 0) %>% 
+  group_by(woreda) %>% summarise(death = sum(death,na.rm = T),
+                                 .groups = "drop") %>% arrange(desc(death))
+
+dth_text <- paste0(dth_report$woreda, " (", dth_report$death, ")", collapse = ", ")
+
+#Top burden woredas 
+
+top_10_woredas <- wkly_dat %>% 
+  arrange(desc(mal_ar)) %>% 
+  slice_head(n = 10)
+
+top_woredas_txt <- paste0(top_10_woredas$woreda, " (", top_10_woredas$mal_ar, " per 1000)", collapse = ", ")
+
+# extracting the top woredas in region
+
+
+top_woreda_rgns <- wkly_dat %>% left_join(ref_gname, by = "woreda") %>% arrange(desc(mal_ar)) %>% 
+  slice_head(n = 10) %>% group_by(region) %>% 
+  summarise(num = n(),
+            .groups = "drop") %>% arrange(desc(num))
+
+top_woreda_rgns_txt <- paste0(top_woreda_rgns$region, " (", top_woreda_rgns$num, ")", collapse = ", ")
+```
+
+## Epidemiological situation
+
+Since January 1, 2025, as of Epi Week `{r} latest_week`, a total of **`r scales::comma(case_this_year)` malaria cases** and **`r death_this_year` deaths** were reported. In Epi Week `r latest_week`, a total of **`r scales::comma(cases_this_week)` malaria cases** and **`r deaths_this_week` deaths** were reported. This represents a **`r abs(week_over_week_change)`% `r ifelse(week_over_week_change<0, "decrement", "increment")`** from last week and a **`r abs(yoy_change)`% `r ifelse(yoy_change<0, "decrement", "increment")`** from the same week in 2024(@fig-plot-national-trend). Theworeda level national incidence and regional level trend of malaria are depicted in @fig-plot-inc-map and @fig-fac-rgn-trnd, respectively.
+
+According to Malaria surveillance report in Epi week `r latest_week`, 2025;
+
+-   `r sum(top_regions$pct)`% of cases were from the five highest reporting regions (`r paste(top_regions_text, collapse = "")`)
+
+-   A total of **`r woreda_count` woredas** reported at least one malaria case. Lab confirmation rate was **`r lab_confirm_rate`%**, with *Plasmodium falciparum* accounting for **`r pf_rate`%** of confirmed cases.
+
+```{r}
+#| warning: false
+#| 
+#| label: fig-plot-national-trend
+#| fig-cap: "National trend of Malaria cases; 2019 to 2025"
+#| fig-width: 8
+#| fig-height: 5
+#| 
+
+
+latest_week <- nat_trend %>% filter(year == 2025) %>% summarise(max(epi_week)) %>% pull()
+label_string <- nat_trend %>%
+  filter(epi_week == latest_week, year %in% 2019:2025) %>%
+  arrange(desc(year)) %>%
+  mutate(line = paste0(year, ": ", scales::comma(total_case))) %>%
+  pull(line) %>%
+  paste(collapse = "\n")
+label_y <- nat_trend %>%
+  filter(year == 2025, epi_week == latest_week) %>%
+  pull(total_case)
+
+# starting the plot
+ggplot(nat_trend, aes(x = epi_week, y = total_case, colour = factor(year), group = factor(year))) +
+  geom_line(size = 1) +
+  geom_point(size = 1.25) +
+  #geom_vline(xintercept = 26, linetype = "dashed", colour = "grey40") +
+  scale_color_manual(values = c(
+    `2019` = "#1f77b4",  # blue
+    `2020` = "#e377c2",  # orange 
+    `2021` = "orange",  # green
+    `2022` = "purple",  # purple
+    `2023` = "lightblue",  # pink
+    `2024` = "#8c564b",  # brown
+    `2025` = "#252525"   # grey
+  )) +
+  labs(
+    #title = "National Trend of Malaria Cases",
+    #subtitle = paste("2019 to 2025(Week ",latest_week,")"),
+    x = "Epi_Week",
+    y = "Total Cases",
+    colour = "Year"
+  ) +
+  theme_minimal(base_family = "Arial") +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    axis.title = element_text(size = 12, face = "bold"),
+    axis.text = element_text(size = 10),
+    axis.line.y.left = element_line(size = 0.5, colour = "black"),
+    axis.line.x.bottom = element_line(size = 0.5, colour = "black"),
+    legend.position = "right",
+    panel.grid = element_blank()
+  ) + 
+  scale_x_continuous(expand = c(0,0),breaks = pretty_breaks(n = 5)) +  # better x-axis scaling
+  scale_y_continuous(expand = c(0,0),labels = scales::comma) +  # comma formatting for large y-axis values
+   annotate("label",
+            x = latest_week + 0.5,          # adjust horizontal position
+            y = label_y,                  # align with 2025's value
+            label = paste0("Week ", latest_week, " Cases\n", label_string),
+            hjust = 0,
+            vjust = 1,
+            size = 3.5,
+            label.size = 0.3,
+            fill = "white",
+            family = "Arial")
+```
+
+```{r}
+#| warning: false
+#| include: true
+#| label: fig-plot-inc-map
+#| fig-width: 8
+#| fig-height: 5.5
+#| fig-dpi: 300
+#| fig-cap: "Woreda level Incidence of Malaria"
+
+ 
+
+wkly_dat_sf <- wkly_dat %>% left_join(eth_adm3, by = c("woreda" = "adm3_en")) %>% 
+  select(woreda, total_case, total_conf, death, pos_rate, mal_ar, population, mal_ar,
+         adm3_pcode, adm2_en, adm2_pcode, adm1_en, adm1_pcode, geometry) %>% 
+  st_as_sf()
+
+# preapring breaks and labels
+max_ar <- ceiling(max(wkly_dat_sf$mal_ar, na.rm = TRUE))
+ar_breaks <- seq(0, max_ar, length.out = 6)
+ar_labels <- paste0(
+  round(ar_breaks[-length(ar_breaks)], 1), " – ", 
+  round(ar_breaks[-1], 1)
+)
+
+
+
+tm_shape(wkly_dat_sf)+
+  tm_polygons("mal_ar", 
+              # breaks = ar_breaks,
+              # labels = ar_labels,
+              breaks = c(0,0.1, 5,10, 50, Inf),
+              labels = c("0", ">0 - <5", "5 - <10", "10 - <50", ">=50"),
+              palette = c("lightblue2",
+                          "#fee391",  
+                          "#fdb863",  
+                          "#f03b20",
+                          "#bd0026" ),
+              title = "Malaria AR per 1000 \nCategory",
+              border.col = NA) +
+  tm_shape(eth_adm1) +
+  tm_borders(col = "black", 
+             lwd = 1.5) +
+  tm_layout(title = paste(" Malaria Incidence Week ", latest_week," 2025"),
+            title.position = c("center","top"),
+            inner.margins = c(0.05, 0.1, 0.1, 0.02),
+            # inner.margins = c(0.25, 0.25, 0.1, 0.02),# bottom, right, top, left margins for content adjustment
+            legend.position = c("left" , "bottom"),
+            legend.title.size = 1.0,
+            legend.text.size = 0.7, 
+            fontfamily = "Arial",
+            bg.color = "White",
+            frame = TRUE
+  ) +
+  tm_compass(position = c("right", "top"),
+             type = "8star", #compass type
+             size = 2 #compass size)
+  ) +
+  tm_scale_bar(
+    position = c("right", "bottom"),
+    text.size = 0.7 #Adjust scale bar text size
+  )
+
+
+```
+
+```{r}
+#| warning: false
+#| include: true
+#| label: fig-fac-rgn-trnd
+#| fig-width: 10
+#| fig-height: 6.5
+#| fig-dpi: 600
+#| fig-cap: "Regional trend of Malaria"
+
+# generating regional level data
+
+rgn_trnd <- mal_dat %>% group_by(region, year, epi_week) %>% 
+  summarise(total_case = sum(total_case, na.rm = T),
+            total_confirmed_s = sum(total_confirmed_s, na.rm = T),
+            test = sum(test, na.rm = T),
+            death = sum(death, na.rm = T),
+            pf = sum(pf, na.rm = T),
+            pv = sum(pv, na.rm = T),
+            mixed = sum(mixed, na.rm = T),
+            inp_case = sum(inp_case, na.rm = T),
+            pos_rate_s = round(sum(total_confirmed_s, na.rm = T)/sum(test, na.rm = T)* 100,2),
+            inp_rate = round(sum(inp_case)/sum(total_case)*100,2),
+            .groups = "drop")
+
+
+
+ggplot(rgn_trnd,aes(x = epi_week, y = total_case, group = year, colour = as.factor(year))) +
+  geom_line(linewidth = 1)+
+  geom_path(size = 1.25) +
+  #geom_vline(xintercept = 26, linetype = "dashed", colour = "blue")+
+  facet_wrap(~region, scales = "free_y", ncol = 4)+
+  labs( 
+    title = "Malaria Case Trend by Region",
+    subtitle = paste("2019 to 2025(Week ",latest_week,")"),
+    x = "Epidemiological week",
+    y = "Total case") +
+    scale_color_manual(values = c(
+      `2019` = "#1f77b4",  # blue
+      `2020` = "#e377c2",  # orange 
+      `2021` = "orange",  # green
+      `2022` = "purple",  # purple
+      `2023` = "lightblue",  # pink
+      `2024` = "#8c564b",  # brown
+      `2025` = "#252525"   # grey
+    )) +
+  theme_minimal() +
+  theme(
+    text = element_text(family = "Arial"),
+    strip.text = element_text(size = 12, face = "bold"),  # facet labels style
+    strip.background = element_rect(fill = "white", color = "black"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.text = element_text(size = 10),
+    axis.line.y.left = element_line(size = 1.0, colour = "black"),
+    axis.title = element_text(size = 12, face = "bold"),
+    panel.grid.major = element_blank(),  # remove grid lines
+    panel.grid.minor = element_blank()  # Remove minor grid lines for clarity
+  ) +
+  scale_x_continuous(breaks = pretty_breaks(n = 5)) +  # better x-axis scaling
+  scale_y_continuous(labels = scales::comma)  # comma formatting for large y-axis values
+
+
+```
+
+In Epi week `r latest_week`, 2025;
+
+-   The inpatient rate was **`r inpatient_this_week`%,** which is a **`r abs(inpatient_change)`% `r ifelse(inpatient_change < 0, "decrease", "increase")`** from the same week last yea**r (`r inpatient_last_year`%**)( @fig-plot-Inp-trend).
+
+-   The case fatality rate was `r cfr_this_week` which is a **`r abs(cfr_change)`% `r ifelse(cfr_change < 0, "decrease", "increase")`** from the same week last yea**r (`r cfr_last_year`%)**.
+
+-   Death was reported from; `r paste(dth_text, collapse = "")`.
+
+```{r}
+#| warning: false
+#| 
+#| label: fig-plot-Inp-trend
+#| fig-cap: "National trend of Malaria Hospitalization rate; 2019 to 2025" 
+#| fig-width: 7
+#| fig-height: 4
+
+label_string <- nat_trend %>%
+  filter(epi_week == latest_week, year %in% 2023:2025) %>%
+  arrange(desc(year)) %>%
+  mutate(line = paste0(year, ": ", scales::comma(inp_rate_s))) %>%
+  pull(line) %>%
+  paste(collapse = "\n")
+label_y <- nat_trend %>%
+  filter(year == 2025, epi_week == latest_week) %>%
+  pull(inp_rate_s)
+
+# Starting the figure
+nat_trend %>% filter(year > 2022) %>% 
+ggplot( aes(x = epi_week, y = round(inp_rate_s,2), colour = factor(year), group = factor(year))) +
+  geom_line(size = 1) +
+  geom_point(size = 1.25) +
+  #geom_vline(xintercept = 26, linetype = "dashed", colour = "grey40") +
+  scale_color_manual(values = c(
+    `2023` = "#8c564b",  
+    `2024` = "#E66C37", 
+    `2025` = "#252525"  
+  )) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    #title = "National Trend of Malaria Hospitalizaiton rate",
+    #subtitle = paste("2019 to 2025(Week ",latest_week,")"),
+    x = "Epi_Week",
+    y = "Inpatient rate(%)",
+    colour = "Year"
+  ) +
+  theme_minimal(base_family = "Arial") +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    axis.title = element_text(size = 12, face = "bold"),
+    axis.text = element_text(size = 10),
+    axis.line.y.left = element_line(size = 0.5, colour = "black"),
+    axis.line.x.bottom = element_line(size = 0.5, colour = "black"),
+    legend.position = "right",
+    panel.grid = element_blank()
+  ) + 
+  scale_x_continuous(expand = c(0,0),breaks = pretty_breaks(n = 5)) +   # better x-axis scaling
+  annotate("label",
+           x = latest_week + 0.5,          # adjust horizontal position
+           y = label_y,                  # align with 2025's value
+           label = paste0("Week ", latest_week, " Inpatient rate\n", label_string),
+           hjust = 0,
+           vjust = 0.7,
+           size = 3.5,
+           label.size = 0.3,
+           fill = "white",
+           family = "Arial")
+
+```
+
+In Epi week `r latest_week`, 2025,
+
+-   The 10 woredas with the highest incidence of malaria per 1000 people are; `r paste(top_woredas_txt, collapse = "")`(@fig-top-woreda-trend-plot).
+
+-   These highest burden woredas are from ; `r paste(top_woreda_rgns_txt, collapse = "")`
+
+-   As is expected for the minor transmission seasons, which is a major transmission seasons in the southwestern part of the country, **8 out of the 10 highly affected woredas** are from **SWEPR and South Ethiopia Region.**
+
+```{r}
+#| warning: false
+#| include: false
+
+
+top_10_woredas <- wkly_dat %>% 
+  arrange(desc(mal_ar)) %>% 
+  slice_head(n = 10)
+
+
+top_10_data_24_25 <- mal_dat %>% filter( year > 2023) %>% 
+  filter(g_name %in% top_10_woredas$woreda) %>% 
+  select(g_name,year, epi_week, total_case) %>% group_by(g_name, year, epi_week) %>% 
+  summarise(epiweek_case = sum(total_case, na.rm = TRUE)) %>% 
+  ungroup()
+
+# To order the data based on latest week trend 
+
+
+order_data <- top_10_data_24_25 %>% filter(year == 2025 & epi_week == latest_week) %>% 
+  arrange(desc(epiweek_case)) %>% mutate(order = row_number()) 
+
+
+Top_10_data_24_25_ord <- top_10_data_24_25 %>% left_join(order_data %>%  select(g_name, order),
+                                                         by = c("g_name"))
+
+#The trick is making it factor as below to show 
+
+Top_10_data_24_25_ord <- Top_10_data_24_25_ord %>%
+  mutate(g_name = factor(g_name, levels = order_data$g_name[order_data$order]))
+
+
+plot_top_woreda  <- ggplot(Top_10_data_24_25_ord, aes(x = epi_week, y = epiweek_case, group = year, colour = as.factor(year))) +
+  geom_line(size = 1) +
+  geom_point(size = 1) +
+  facet_wrap(~g_name, scales = "free_y", ncol = 4)+
+  theme_minimal()+
+  labs(title = "Malaria Trend of 10 woredas with highest incidence" ,
+       subtitle = paste("2025 as of Week ",latest_week),
+       x = "Epi week", y = "Cases") +
+  scale_color_manual(values = c("2025" = "black", "2024" = "#E66C37")) +
+  theme(
+    text = element_text(family = "Arial"),
+    strip.text = element_text(size = 12, face = "bold"),  # facet labels style
+    strip.background = element_rect(fill = "white", color = "black"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.text = element_text(size = 10),
+    axis.line.y.left = element_line(size = 1.0, colour = "black"),
+    axis.title = element_text(size = 12, face = "bold"),
+    panel.grid.major = element_blank(),  # remove grid lines
+    panel.grid.minor = element_blank()  # Remove minor grid lines for clarity
+  ) +
+  scale_x_continuous(breaks = pretty_breaks(n = 5)) +  # better x-axis scaling
+  scale_y_continuous(labels = scales::comma)  # comma formatting for large y-axis values
+
+
+top_10_map <- eth_adm3 %>% filter(adm3_en %in% top_10_woredas$woreda)
+
+map_plot <- tm_shape(eth_adm1) +
+  tm_borders() +
+  tm_shape(top_10_map) +
+  tm_fill(col = "red", alpha = 0.3, title = "Top 10 Woredas") +  # Fill color for the top 10 woredas
+  tm_text("adm3_en", size = 0.7, col = "black", auto.placement = TRUE) +  # Label woredas
+  tm_borders(lwd = 0.5) +  # Woreda borders
+  tm_layout(main.title = paste("Woredas with Highest Malaria Incidence (Week", latest_week,")"),
+            main.title.size = 1, 
+            main.title.position = "center", 
+            inner.margins = c(-0, 0.1, 0, 0.15) ,
+            frame = FALSE)
+map_plot_gg <- tmap_grob(map_plot)
+
+
+
+
+```
+
+```{r}
+#| warning: false
+#| label: fig-top-woreda-trend-plot
+#| fig-cap: "Trend of Malaria in 10 woredas reporting higest incidence of malaria "
+#| fig-width: 16
+#| fig-height: 8
+ 
+plot_top_woreda + map_plot_gg + plot_layout(widths = c(1, 1)) 
+
+```
+
+## Response Measures
+
+-   The malaria epidemic response is coordinated, in collaboration with partners, under the national Malaria Incident Management system (NMIMS).
+
+-   A high-level integarted supportive supervision was conducted to regions and higly affected woredas, jointly with the National Malaria Program.
+
+-   Malaria commodities are being distributed to affected regions based on weekly surveillance malaria burden reports.
+
+-   Daily follow-ups are conducted by regions to track surveillance and response efforts at the woreda level, while weekly feedback is provided based on surveillance reports.
